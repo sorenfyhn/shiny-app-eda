@@ -3,8 +3,8 @@ import duckdb
 import polars as pl
 import matplotlib.pyplot as plt
 import matplotlib
-import seaborn as sns
 import numpy as np
+
 matplotlib.use("Agg")  # Use non-interactive backend for Shiny
 
 
@@ -35,8 +35,8 @@ app_ui = ui.page_fluid(
             ),
             ui.nav_panel(
                 "Correlation",
-                ui.h4("Correlation"),
-                ui.output_ui("correlation_plots"),
+                ui.h4("Pairwise Correlations (|r| >= 0.7)"),
+                ui.output_data_frame("correlation_table"),
             ),
         ),
     ),
@@ -45,6 +45,14 @@ app_ui = ui.page_fluid(
 
 # Server: Define the application logic
 def server(input, output, session):
+    def _is_numeric_column(series):
+        """Check if a Polars Series has a numeric dtype"""
+        return series.dtype in pl.NUMERIC_DTYPES
+
+    def _get_numerical_columns(df):
+        """Get list of numerical column names from DataFrame"""
+        return [col for col in df.columns if df[col].dtype in pl.NUMERIC_DTYPES]
+
     @reactive.Calc
     def load_data():
         """Load data once and cache it"""
@@ -61,6 +69,12 @@ def server(input, output, session):
         con.close()
 
         return df
+
+    @reactive.Calc
+    def numerical_columns():
+        """Get numerical column names from loaded data (cached)"""
+        df = load_data()
+        return _get_numerical_columns(df)
 
     @output
     @render.text
@@ -109,7 +123,10 @@ def server(input, output, session):
     @output
     @render.data_frame
     def column_details():
-        """Display detailed column statistics including datatype, counts, missing values, mixed type detection, and example values"""
+        """Display detailed column statistics including datatype, counts, missing values, cardinality,
+        mixed type detection, numerical statistics (mean, variance, std, quartiles),
+        categorical imbalance detection, and example values
+        """
         df = load_data()
 
         # Check if DataFrame has data
@@ -129,12 +146,17 @@ def server(input, output, session):
         return pl.DataFrame(column_stats)
 
     def _get_column_stats(series: pl.Series, col_name: str, total_rows: int) -> dict:
-        """Calculate statistics for a single column"""
+        """Calculate comprehensive statistics for a single column
+
+        Returns dict with type info, counts, missing values, cardinality,
+        numerical stats (mean, variance, std, quartiles) for numeric columns,
+        and imbalance detection for categorical columns
+        """
         null_count = series.null_count()
         dtype = str(series.dtype)
 
         # Determine if column is numerical or categorical
-        col_type = "Numerical" if series.dtype in pl.NUMERIC_DTYPES else "Categorical"
+        col_type = "Numerical" if _is_numeric_column(series) else "Categorical"
 
         # Calculate missing percentage
         missing_pct = round((null_count / total_rows * 100), 2) if total_rows > 0 else 0
@@ -155,7 +177,7 @@ def server(input, output, session):
         example_value = _get_example_value(series)
 
         # Calculate numerical statistics for numerical columns
-        if series.dtype in pl.NUMERIC_DTYPES:
+        if _is_numeric_column(series):
             min_val = series.min()
             max_val = series.max()
             mean_val = round(series.mean(), 3)
@@ -213,7 +235,11 @@ def server(input, output, session):
         }
 
     def _detect_mixed_types(series: pl.Series, dtype: str) -> str:
-        """Detect if a string column contains mixed types"""
+        """Detect if a string column contains mixed types (numeric and non-numeric values)
+
+        Returns 'Yes' if column contains both values that can be parsed as numbers
+        and values that cannot, 'No' otherwise
+        """
         if dtype not in ["Utf8", "String"]:
             return "No"
 
@@ -242,10 +268,10 @@ def server(input, output, session):
     def _create_histogram(data, col_name):
         """Create a histogram for a numerical column using Freedman-Diaconis rule"""
         fig, ax = plt.subplots(figsize=(6, 4))
-        ax.hist(data, bins='fd', edgecolor="black", alpha=0.7, color="steelblue")
+        ax.hist(data, bins="fd", edgecolor="black", alpha=0.7, color="steelblue")
         ax.set_xlabel("Value")
         ax.set_ylabel("Frequency")
-        ax.set_title(f"Histogram")
+        ax.set_title("Histogram")
         ax.grid(True, alpha=0.3)
         ax.ticklabel_format(style="plain", axis="both")
         plt.tight_layout()
@@ -253,37 +279,34 @@ def server(input, output, session):
 
     def _create_boxplot(data, col_name):
         """Create a boxplot for a numerical column"""
-        fig, ax = plt.subplots(figsize=(6, 4))
+        fig, ax = plt.subplots(figsize=(3, 4))
         ax.boxplot(data, vert=True)
         ax.set_ylabel("Value")
-        ax.set_title(f"Boxplot")
+        ax.set_title("Boxplot")
         ax.grid(True, alpha=0.3)
         ax.ticklabel_format(style="plain", axis="y")
         plt.tight_layout()
         return fig
 
-    def _create_correlation_heatmap(df, method='pearson', title=''):
-        """Create a correlation heatmap for numerical columns"""
-        # Filter numerical columns
-        numerical_cols = [
-            col for col in df.columns if df[col].dtype in pl.NUMERIC_DTYPES
-        ]
+    def _create_correlation_table(df, numerical_cols, threshold=0.7):
+        """Create a correlation table for numerical columns showing pairwise correlations above threshold
 
+        Returns Polars DataFrame with columns: Variable 1, Variable 2, Pearson, Spearman.
+        Filters to show only pairs where absolute correlation >= threshold for either method.
+        Results sorted by absolute Pearson correlation (descending). Excludes self-correlations.
+        """
         if len(numerical_cols) == 0:
-            fig, ax = plt.subplots(figsize=(8, 6))
-            ax.text(0.5, 0.5, "No numerical columns available for correlation",
-                   ha='center', va='center', fontsize=12)
-            ax.axis('off')
-            return fig
+            return pl.DataFrame(
+                {"Message": ["No numerical columns available for correlation"]}
+            )
+
+        if len(numerical_cols) < 2:
+            return pl.DataFrame(
+                {"Message": ["At least 2 numerical columns required for correlation"]}
+            )
 
         # Convert to numpy for correlation calculation
         df_numeric = df.select(numerical_cols)
-
-        # Calculate correlation matrix using Polars
-        # Convert to pandas for easier correlation calculation
-        corr_data = {}
-        for col in numerical_cols:
-            corr_data[col] = df_numeric[col].drop_nulls().to_numpy()
 
         # Create numpy array (fill missing values with column mean for correlation)
         data_arrays = []
@@ -296,35 +319,52 @@ def server(input, output, session):
 
         data_matrix = np.column_stack(data_arrays)
 
-        # Calculate correlation matrix
-        if method == 'pearson':
-            corr_matrix = np.corrcoef(data_matrix, rowvar=False)
-        else:  # spearman
-            from scipy.stats import spearmanr
-            corr_matrix, _ = spearmanr(data_matrix, axis=0)
+        # Calculate correlation matrices
+        pearson_matrix = np.corrcoef(data_matrix, rowvar=False)
 
-        # Create heatmap
-        fig, ax = plt.subplots(figsize=(20, 14))
-        sns.heatmap(
-            corr_matrix,
-            annot=True,
-            fmt='.2f',
-            cmap='coolwarm',
-            center=0,
-            square=True,
-            linewidths=0.5,
-            cbar_kws={"shrink": 0.8},
-            xticklabels=numerical_cols,
-            yticklabels=numerical_cols,
-            ax=ax,
-            vmin=-1,
-            vmax=1
+        from scipy.stats import spearmanr
+
+        spearman_matrix, _ = spearmanr(data_matrix, axis=0)
+
+        # Build correlation table in long format
+        correlations = []
+        for i in range(len(numerical_cols)):
+            for j in range(
+                i + 1, len(numerical_cols)
+            ):  # Only upper triangle, exclude diagonal
+                pearson_corr = pearson_matrix[i, j]
+                spearman_corr = spearman_matrix[i, j]
+
+                # Filter by threshold (absolute value)
+                if abs(pearson_corr) >= threshold or abs(spearman_corr) >= threshold:
+                    correlations.append(
+                        {
+                            "Variable 1": numerical_cols[i],
+                            "Variable 2": numerical_cols[j],
+                            "Pearson": round(pearson_corr, 3),
+                            "Spearman": round(spearman_corr, 3),
+                        }
+                    )
+
+        # Create DataFrame and sort by absolute Pearson correlation
+        if len(correlations) == 0:
+            return pl.DataFrame(
+                {
+                    "Message": [
+                        f"No correlations found with absolute value >= {threshold}"
+                    ]
+                }
+            )
+
+        corr_df = pl.DataFrame(correlations)
+        # Sort by absolute Pearson correlation descending
+        corr_df = (
+            corr_df.with_columns(pl.col("Pearson").abs().alias("abs_pearson"))
+            .sort("abs_pearson", descending=True)
+            .drop("abs_pearson")
         )
-        ax.set_title(title, fontsize=14, fontweight='bold')
-        plt.xticks(rotation=90, ha='right')
-        plt.yticks(rotation=0)
-        plt.tight_layout()
-        return fig
+
+        return corr_df
 
     @output
     @render.ui
@@ -336,10 +376,8 @@ def server(input, output, session):
         if len(df.columns) == 0:
             return ui.p("No data available. Please upload a CSV file.")
 
-        # Get numerical columns
-        numerical_cols = [
-            col for col in df.columns if df[col].dtype in pl.NUMERIC_DTYPES
-        ]
+        # Get cached numerical columns
+        numerical_cols = numerical_columns()
 
         if len(numerical_cols) == 0:
             return ui.p("No numerical columns found in the dataset.")
@@ -368,7 +406,7 @@ def server(input, output, session):
                         ui.column(6, ui.output_plot(hist_id)),
                         ui.column(6, ui.output_plot(box_id)),
                     ),
-                    style="text-align: left;"
+                    style="text-align: left;",
                 )
             )
             plot_elements.append(ui.hr())
@@ -392,60 +430,18 @@ def server(input, output, session):
         return ui.div(*plot_elements)
 
     @output
-    @render.ui
-    def correlation_plots():
-        """Generate correlation heatmaps for Pearson and Spearman methods"""
+    @render.data_frame
+    def correlation_table():
+        """Display pairwise correlations table filtered by threshold (>= 0.7)"""
         df = load_data()
 
         # Check if DataFrame has data
         if len(df.columns) == 0:
-            return ui.p("No data available. Please upload a CSV file.")
-
-        # Get numerical columns
-        numerical_cols = [
-            col for col in df.columns if df[col].dtype in pl.NUMERIC_DTYPES
-        ]
-
-        if len(numerical_cols) == 0:
-            return ui.p("No numerical columns found in the dataset.")
-
-        if len(numerical_cols) < 2:
-            return ui.p("At least 2 numerical columns are required for correlation analysis.")
-
-        # Create plot elements
-        plot_elements = []
-
-        # Add Pearson correlation heatmap
-        plot_elements.append(ui.h5("Pearson Correlation"))
-        plot_elements.append(
-            ui.div(
-                ui.output_plot("pearson_heatmap", width="100%", height="800px"),
-                style="text-align: left;"
+            return pl.DataFrame(
+                {"Message": ["No data available. Please upload a CSV file."]}
             )
-        )
-        plot_elements.append(ui.hr())
 
-        # Add Spearman correlation heatmap
-        plot_elements.append(ui.h5("Spearman Correlation"))
-        plot_elements.append(
-            ui.div(
-                ui.output_plot("spearman_heatmap", width="100%", height="800px"),
-                style="text-align: left;"
-            )
-        )
-
-        # Register the plot renderers
-        @output(id="pearson_heatmap")
-        @render.plot
-        def _():
-            return _create_correlation_heatmap(df, method='pearson', title='Pearson Correlation')
-
-        @output(id="spearman_heatmap")
-        @render.plot
-        def _():
-            return _create_correlation_heatmap(df, method='spearman', title='Spearman Correlation')
-
-        return ui.div(*plot_elements)
+        return _create_correlation_table(df, numerical_columns(), threshold=0.7)
 
 
 # Create the Shiny app
